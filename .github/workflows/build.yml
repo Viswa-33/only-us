@@ -1,0 +1,166 @@
+# Builds the Only Us test app (an .apk file) on GitHub's free computers.
+# Add this file once. After that, every time a new OnlyUs.zip is uploaded to the repository, a new build starts by itself.
+# It can also be started by hand: Actions tab, then "Run workflow".
+name: Build Only Us test app
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write # only used to put the .apk on the Releases page
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build the test app
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Get the files
+        uses: actions/checkout@v6
+
+      # The project can be uploaded as one zip file (easiest on the GitHub website) or as ordinary files.
+      - name: Unpack OnlyUs.zip
+        shell: bash
+        run: |
+          shopt -s nullglob
+          zips=(*.zip)
+          problem() {
+            { echo "## There is a problem with the zip file"; echo; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"
+            echo "$1"
+            exit 1
+          }
+          if [ "${#zips[@]}" -gt 1 ]; then
+            problem "More than one zip file is in the repository (${zips[*]}). Open the older one, click the bin icon, commit, then run this again."
+          elif [ "${#zips[@]}" -eq 1 ]; then
+            echo "Unpacking ${zips[0]}"
+            unzip -oq "${zips[0]}"
+            if [ ! -f gradlew ]; then
+              inner=$(dirname "$(find . -maxdepth 3 -name gradlew | head -n 1)")
+              if [ -f "$inner/gradlew" ]; then cp -a "$inner"/. .; fi
+            fi
+          fi
+          [ -f gradlew ] || problem "The Only Us project files were not found. Upload OnlyUs.zip on the front page of the repository."
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Remembers what Gradle downloaded, so the next build is faster.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          validate-wrappers: false
+
+      - name: Accept the Android licences
+        shell: bash
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # Files uploaded through a browser lose their "may run" flag, so set it again.
+      - name: Allow the build script to run
+        run: chmod +x gradlew
+
+      - name: Build the app
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --console=plain 2>&1 | tee build.log
+
+      - name: Collect the .apk
+        shell: bash
+        run: |
+          apk=$(find app/build/outputs/apk/debug -name '*.apk' | head -n 1)
+          test -n "$apk"
+          mkdir -p dist
+          cp "$apk" dist/OnlyUs-test.apk
+          ls -l dist
+
+      # A copy on this run's own page (scroll down to "Artifacts"). It is not zipped, so it can be opened directly.
+      - name: Keep a copy on this page
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/OnlyUs-test.apk
+          archive: false
+          retention-days: 30
+          if-no-files-found: error
+
+      # The Releases page keeps one entry, "test-build", replaced on every build. Easy to open on a phone.
+      - name: Publish on the Releases page
+        id: release
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete test-build --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          gh release create test-build dist/OnlyUs-test.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Only Us - latest test app" \
+            --notes "Built automatically from the latest code. On an Android phone: open this page, tap OnlyUs-test.apk, then install it."
+
+      - name: Run the unit tests
+        id: tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew testDebugUnitTest --console=plain 2>&1 | tee test.log
+
+      - name: Write the summary (everything worked)
+        if: success()
+        shell: bash
+        env:
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+        run: |
+          {
+            echo "## The app was built and the tests passed"
+            echo
+            if [ "$RELEASE_OUTCOME" = "success" ]; then
+              echo "Get it from the **Releases** section on the repository's front page (file **OnlyUs-test.apk**),"
+              echo "or scroll down on this page to **Artifacts**."
+            else
+              echo "Scroll down on this page to **Artifacts** and download **OnlyUs-test.apk**."
+              echo "(Publishing on the Releases page did not work this time; the file itself is fine.)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write the summary (the build stopped)
+        if: ${{ always() && steps.build.outcome == 'failure' }}
+        shell: bash
+        run: |
+          errors=$(grep -E -A2 '^e: |error:|ERROR|FAILURE|What went wrong|Execution failed|Could not |A problem occurred' build.log | head -n 120 || true)
+          if [ -z "$errors" ]; then errors=$(tail -n 60 build.log); fi
+          {
+            echo "## The build stopped with errors"
+            echo
+            echo "Copy everything inside the grey box below and send it to Claude. Nothing else is needed."
+            echo
+            printf '\x60\x60\x60\n'
+            echo "$errors"
+            printf '\x60\x60\x60\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write the summary (a test failed)
+        if: ${{ always() && steps.tests.outcome == 'failure' }}
+        shell: bash
+        run: |
+          errors=$(grep -E -B1 -A6 'FAILED|AssertionError|What went wrong' test.log | head -n 120 || true)
+          if [ -z "$errors" ]; then errors=$(tail -n 60 test.log); fi
+          {
+            echo "## The app was built, but a unit test failed"
+            echo
+            echo "The app file is still available (see the Releases section). Copy the box below and send it to Claude."
+            echo
+            printf '\x60\x60\x60\n'
+            echo "$errors"
+            printf '\x60\x60\x60\n'
+          } >> "$GITHUB_STEP_SUMMARY"
