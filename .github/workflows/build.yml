@@ -1,6 +1,10 @@
 # Builds the Only Us test app (an .apk file) on GitHub's free computers.
 # Add this file once. After that, every time a new OnlyUs.zip is uploaded to the repository, a new build starts by itself.
 # It can also be started by hand: Actions tab, then "Run workflow".
+#
+# A green tick means the app file was built and can be downloaded.
+# The summary on the run's page also says whether the automatic tests passed. A failed test never holds back the app file.
+# If the build stops, the summary shows the reason in a box that can be copied, and the full log is kept as "build-logs".
 name: Build Only Us test app
 
 on:
@@ -18,7 +22,7 @@ jobs:
   build:
     name: Build the test app
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Get the files
@@ -31,15 +35,25 @@ jobs:
           shopt -s nullglob
           zips=(*.zip)
           problem() {
-            { echo "## There is a problem with the zip file"; echo; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"
-            echo "$1"
+            {
+              echo "## There is a problem with the zip file"
+              echo
+              echo "$1"
+              echo
+              echo "This is what GitHub can see on the front page of the repository:"
+              echo
+              printf '\x60\x60\x60\n'
+              ls -1 | head -n 40
+              printf '\x60\x60\x60\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Problem with the zip file::$1"
             exit 1
           }
           if [ "${#zips[@]}" -gt 1 ]; then
             problem "More than one zip file is in the repository (${zips[*]}). Open the older one, click the bin icon, commit, then run this again."
           elif [ "${#zips[@]}" -eq 1 ]; then
             echo "Unpacking ${zips[0]}"
-            unzip -oq "${zips[0]}"
+            unzip -oq "${zips[0]}" || problem "The zip file could not be opened. It may not have finished uploading. Upload OnlyUs.zip again."
             if [ ! -f gradlew ]; then
               inner=$(dirname "$(find . -maxdepth 3 -name gradlew | head -n 1)")
               if [ -f "$inner/gradlew" ]; then cp -a "$inner"/. .; fi
@@ -67,24 +81,77 @@ jobs:
       - name: Allow the build script to run
         run: chmod +x gradlew
 
+      # If a download fails at random (not because of the app), the build is tried once more.
       - name: Build the app
         id: build
         shell: bash
         run: |
-          set -o pipefail
-          ./gradlew assembleDebug --console=plain 2>&1 | tee build.log
+          flaky='Downloading from .* failed|Read timed out|Connect timed out|Connection (reset|timed out)|Premature end of|Received status code (429|5[0-9][0-9])|Remote host terminated|Unexpected end of file|SSLHandshakeException|SocketException|UnknownHostException|NoHttpResponseException|Gradle build daemon disappeared'
+          attempt=1
+          while true; do
+            set +e
+            ./gradlew assembleDebug --console=plain --stacktrace 2>&1 | tee build.log
+            code=${PIPESTATUS[0]}
+            set -e
+            if [ "$code" -eq 0 ]; then exit 0; fi
+            if [ "$attempt" -ge 2 ] || ! grep -E -q "$flaky" build.log; then exit "$code"; fi
+            echo "::warning title=Trying again::A download failed at random, so the build is being run once more."
+            mv build.log build-attempt1.log
+            attempt=2
+            sleep 20
+          done
+
+      - name: Explain the build failure
+        if: ${{ !cancelled() && steps.build.outcome == 'failure' }}
+        shell: bash
+        run: |
+          # Kotlin errors start with "e: ". Errors from the code generators (Hilt) contain ": error: ".
+          kotlin=$(grep -E '^e: ' build.log | sed 's|^e: file://|e: |' | awk '!seen[$0]++' | head -n 30 || true)
+          java=$(grep -E ': error: ' build.log | awk '!seen[$0]++' | head -n 20 || true)
+          wrong=$(awk '/^\* What went wrong:/{p=1; next} /^\* Try:/{p=0} p' build.log | head -n 30 || true)
+          # The first few errors also appear at the top of this run's page, as red notes.
+          notes=$({ printf '%s\n' "$kotlin"; printf '%s\n' "$java"; printf '%s\n' "$wrong"; } | grep -v '^[[:space:]]*$' | head -n 10 || true)
+          if [ -z "$notes" ]; then notes=$(tail -n 8 build.log); fi
+          printf '%s\n' "$notes" | while IFS= read -r line; do
+            msg=${line//'%'/'%25'}
+            msg=${msg//$'\r'/'%0D'}
+            echo "::error title=Build error::${msg:0:600}"
+          done
+          {
+            echo "## The build stopped with errors"
+            echo
+            echo "Copy everything inside the grey box below and send it to Claude. Nothing else is needed."
+            echo
+            printf '\x60\x60\x60\n'
+            if [ -n "$kotlin$java$wrong" ]; then
+              if [ -n "$kotlin" ]; then echo "--- Errors found by the compiler"; printf '%s\n' "$kotlin"; fi
+              if [ -n "$java" ]; then echo "--- Errors in generated Java code"; printf '%s\n' "$java"; fi
+              if [ -n "$wrong" ]; then echo "--- What Gradle says went wrong"; printf '%s\n' "$wrong"; fi
+            else
+              echo "--- Last lines of the log"
+              tail -n 60 build.log
+            fi
+            printf '\x60\x60\x60\n'
+            echo
+            echo "The complete log is saved too: scroll down on this page to **Artifacts** and open **build-logs**."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect the .apk
         shell: bash
         run: |
-          apk=$(find app/build/outputs/apk/debug -name '*.apk' | head -n 1)
-          test -n "$apk"
+          apk=$(find app/build/outputs/apk/debug -name '*.apk' 2>/dev/null | head -n 1 || true)
+          if [ -z "$apk" ]; then
+            echo "::error title=No app file::The build finished, but no .apk file was made."
+            exit 1
+          fi
           mkdir -p dist
           cp "$apk" dist/OnlyUs-test.apk
           ls -l dist
 
       # A copy on this run's own page (scroll down to "Artifacts"). It is not zipped, so it can be opened directly.
       - name: Keep a copy on this page
+        id: upload
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           path: dist/OnlyUs-test.apk
@@ -108,59 +175,72 @@ jobs:
             --title "Only Us - latest test app" \
             --notes "Built automatically from the latest code. On an Android phone: open this page, tap OnlyUs-test.apk, then install it."
 
+      # Runs after the app file is safely stored, so a failing test can never hold the app back.
       - name: Run the unit tests
         id: tests
+        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
           ./gradlew testDebugUnitTest --console=plain 2>&1 | tee test.log
 
-      - name: Write the summary (everything worked)
-        if: success()
+      # The full text of what happened, for when something needs a closer look.
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: |
+            build.log
+            build-attempt1.log
+            test.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Write the summary
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         env:
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
           RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
         run: |
+          if [ "$UPLOAD_OUTCOME" != "success" ] && [ "$RELEASE_OUTCOME" != "success" ]; then
+            {
+              echo "## The app was built, but it could not be saved anywhere you can download it"
+              echo
+              echo "This is unusual. Press **Re-run all jobs** at the top right of this page. If it happens again, send Claude a screenshot of this page."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=No download::The app was built but could not be saved for download."
+            exit 1
+          fi
           {
-            echo "## The app was built and the tests passed"
+            echo "## The app was built"
             echo
-            if [ "$RELEASE_OUTCOME" = "success" ]; then
-              echo "Get it from the **Releases** section on the repository's front page (file **OnlyUs-test.apk**),"
-              echo "or scroll down on this page to **Artifacts**."
-            else
-              echo "Scroll down on this page to **Artifacts** and download **OnlyUs-test.apk**."
-              echo "(Publishing on the Releases page did not work this time; the file itself is fine.)"
-            fi
+            echo "Get the app file (**OnlyUs-test.apk**) here:"
+            echo
+            if [ "$RELEASE_OUTCOME" = "success" ]; then echo "- the **Releases** section on the repository's front page"; fi
+            if [ "$UPLOAD_OUTCOME" = "success" ]; then echo "- scroll down on this page to **Artifacts**"; fi
+            echo
+            case "$TESTS_OUTCOME" in
+              success)
+                echo "**Automatic tests: all passed.**"
+                ;;
+              failure)
+                echo "**Automatic tests: at least one failed.** The app file can still be installed. Copy the grey box below and send it to Claude."
+                echo
+                printf '\x60\x60\x60\n'
+                errors=$(grep -E -B1 -A6 'FAILED|AssertionError|What went wrong' test.log | head -n 120 || true)
+                if [ -z "$errors" ]; then errors=$(tail -n 60 test.log); fi
+                printf '%s\n' "$errors"
+                printf '\x60\x60\x60\n'
+                ;;
+              *)
+                echo "**Automatic tests: they did not run.**"
+                ;;
+            esac
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Write the summary (the build stopped)
-        if: ${{ always() && steps.build.outcome == 'failure' }}
-        shell: bash
-        run: |
-          errors=$(grep -E -A2 '^e: |error:|ERROR|FAILURE|What went wrong|Execution failed|Could not |A problem occurred' build.log | head -n 120 || true)
-          if [ -z "$errors" ]; then errors=$(tail -n 60 build.log); fi
-          {
-            echo "## The build stopped with errors"
-            echo
-            echo "Copy everything inside the grey box below and send it to Claude. Nothing else is needed."
-            echo
-            printf '\x60\x60\x60\n'
-            echo "$errors"
-            printf '\x60\x60\x60\n'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Write the summary (a test failed)
-        if: ${{ always() && steps.tests.outcome == 'failure' }}
-        shell: bash
-        run: |
-          errors=$(grep -E -B1 -A6 'FAILED|AssertionError|What went wrong' test.log | head -n 120 || true)
-          if [ -z "$errors" ]; then errors=$(tail -n 60 test.log); fi
-          {
-            echo "## The app was built, but a unit test failed"
-            echo
-            echo "The app file is still available (see the Releases section). Copy the box below and send it to Claude."
-            echo
-            printf '\x60\x60\x60\n'
-            echo "$errors"
-            printf '\x60\x60\x60\n'
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$TESTS_OUTCOME" = "failure" ]; then
+            echo "::warning title=Automatic tests failed::The app was built, but at least one unit test failed. See the summary on this page."
+          fi
